@@ -5,6 +5,15 @@
 (define-constant ERR_INVALID_INSTITUTION (err u103))
 (define-constant ERR_INVALID_HASH (err u104))
 
+(define-constant ERR_INVALID_LICENSE (err u105))
+(define-constant ERR_LICENSE_EXISTS (err u106))
+
+(define-constant LICENSE_PUBLIC u1)
+(define-constant LICENSE_INSTITUTIONAL u2)
+(define-constant LICENSE_RESTRICTED u3)
+(define-constant LICENSE_PRIVATE u4)
+
+
 (define-data-var contract-owner principal CONTRACT_OWNER)
 (define-data-var total-submissions uint u0)
 (define-data-var total-institutions uint u0)
@@ -194,5 +203,78 @@
       (ok true)
     )
     (err ERR_UNAUTHORIZED)
+  )
+)
+
+(define-map content-licenses
+  { content-hash: (buff 32) }
+  {
+    license-type: uint,
+    attribution-required: bool,
+    commercial-use: bool,
+    modification-allowed: bool,
+    expiry-block: (optional uint),
+    licensing-institution: principal
+  }
+)
+
+(define-public (set-content-license 
+  (content-hash (buff 32))
+  (license-type uint)
+  (attribution-required bool)
+  (commercial-use bool)
+  (modification-allowed bool)
+  (expiry-blocks (optional uint)))
+  (let (
+    (institution tx-sender)
+    (current-block stacks-block-height)
+    (expiry-block (match expiry-blocks
+      blocks (some (+ current-block blocks))
+      none
+    ))
+  )
+    (match (map-get? submissions { content-hash: content-hash })
+      submission-data
+      (if (is-eq (get institution submission-data) institution)
+        (if (and (>= license-type LICENSE_PUBLIC) (<= license-type LICENSE_PRIVATE))
+          (if (is-none (map-get? content-licenses { content-hash: content-hash }))
+            (begin
+              (map-set content-licenses
+                { content-hash: content-hash }
+                {
+                  license-type: license-type,
+                  attribution-required: attribution-required,
+                  commercial-use: commercial-use,
+                  modification-allowed: modification-allowed,
+                  expiry-block: expiry-block,
+                  licensing-institution: institution
+                }
+              )
+              (ok true)
+            )
+            (err ERR_LICENSE_EXISTS)
+          )
+          (err ERR_INVALID_LICENSE)
+        )
+        (err ERR_UNAUTHORIZED)
+      )
+      (err ERR_NOT_FOUND)
+    )
+  )
+)
+
+(define-read-only (get-content-license (content-hash (buff 32)))
+  (map-get? content-licenses { content-hash: content-hash })
+)
+
+(define-read-only (check-license-validity (content-hash (buff 32)))
+  (match (map-get? content-licenses { content-hash: content-hash })
+    license-data
+    (match (get expiry-block license-data)
+      expiry-block
+      (ok { valid: (<= stacks-block-height expiry-block), license: (some license-data) })
+      (ok { valid: true, license: (some license-data) })
+    )
+    (ok { valid: false, license: none })
   )
 )

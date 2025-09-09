@@ -13,6 +13,10 @@
 (define-constant LICENSE_RESTRICTED u3)
 (define-constant LICENSE_PRIVATE u4)
 
+(define-constant CITATION_DIRECT u1)
+(define-constant CITATION_INDIRECT u2)
+(define-constant CITATION_DERIVATIVE u3)
+
 
 (define-data-var contract-owner principal CONTRACT_OWNER)
 (define-data-var total-submissions uint u0)
@@ -277,4 +281,195 @@
     )
     (ok { valid: false, license: none })
   )
+)
+
+
+(define-map content-citations
+  { citing-content: (buff 32), cited-content: (buff 32) }
+  {
+    citation-type: uint,
+    citation-context: (string-ascii 100),
+    timestamp: uint,
+    citing-institution: principal
+  }
+)
+
+(define-map citation-scores
+  { content-hash: (buff 32) }
+  {
+    times-cited: uint,
+    citation-quality-score: uint,
+    last-citation-block: uint
+  }
+)
+
+(define-map institution-citation-stats
+  { institution: principal }
+  {
+    total-citations-made: uint,
+    total-citations-received: uint,
+    citation-reputation: uint
+  }
+)
+
+(define-public (submit-with-citations 
+  (content-hash (buff 32))
+  (course-code (string-ascii 20))
+  (student-id (string-ascii 50))
+  (submission-type (string-ascii 20))
+  (cited-content (list 5 (buff 32)))
+  (citation-types (list 5 uint))
+  (citation-contexts (list 5 (string-ascii 100))))
+  (let (
+    (institution tx-sender)
+    (current-block stacks-block-height)
+    (current-time (default-to u0 (get-stacks-block-info? time current-block)))
+  )
+    (let ((submission-count (var-get total-submissions)))
+      (match (map-get? institutions { institution: institution })
+        institution-data
+        (if (get verified institution-data)
+          (if (is-none (map-get? submissions { content-hash: content-hash }))
+            (begin
+              (map-set submissions
+                { content-hash: content-hash }
+                {
+                  institution: institution,
+                  course-code: course-code,
+                  student-id: student-id,
+                  submission-type: submission-type,
+                  timestamp: current-time,
+                  block-height: current-block,
+                  verified: true
+                }
+              )
+              (map-set institution-submissions
+                { institution: institution, submission-index: (get total-submissions institution-data) }
+                { content-hash: content-hash }
+              )
+              (map-set institutions
+                { institution: institution }
+                (merge institution-data { total-submissions: (+ (get total-submissions institution-data) u1) })
+              )
+              (var-set total-submissions (+ submission-count u1))
+              (process-citations content-hash cited-content citation-types citation-contexts 
+                                institution current-time)
+              (update-citation-stats institution (len cited-content))
+              (ok content-hash)
+            )
+            (err ERR_ALREADY_EXISTS)
+          )
+          (err ERR_INVALID_INSTITUTION)
+        )
+        (err ERR_NOT_FOUND)
+      )
+    )
+  )
+)
+
+(define-private (process-citations 
+  (citing-content (buff 32))
+  (cited-list (list 5 (buff 32)))
+  (type-list (list 5 uint))
+  (context-list (list 5 (string-ascii 100)))
+  (institution principal)
+  (timestamp uint))
+  (begin
+    (process-citation-at-index citing-content cited-list type-list context-list institution timestamp u0)
+    (process-citation-at-index citing-content cited-list type-list context-list institution timestamp u1)
+    (process-citation-at-index citing-content cited-list type-list context-list institution timestamp u2)
+    (process-citation-at-index citing-content cited-list type-list context-list institution timestamp u3)
+    (process-citation-at-index citing-content cited-list type-list context-list institution timestamp u4)
+    true
+  )
+)
+
+(define-private (process-citation-at-index
+  (citing-content (buff 32))
+  (cited-list (list 5 (buff 32)))
+  (type-list (list 5 uint))
+  (context-list (list 5 (string-ascii 100)))
+  (institution principal)
+  (timestamp uint)
+  (index uint))
+  (let (
+    (cited-content (default-to 0x (element-at cited-list index)))
+    (citation-type (default-to u0 (element-at type-list index)))
+    (citation-context (default-to "" (element-at context-list index)))
+  )
+    (if (> (len cited-content) u0)
+      (begin
+        (map-set content-citations
+          { citing-content: citing-content, cited-content: cited-content }
+          {
+            citation-type: citation-type,
+            citation-context: citation-context,
+            timestamp: timestamp,
+            citing-institution: institution
+          }
+        )
+        (update-cited-content-score cited-content citation-type)
+        true
+      )
+      false
+    )
+  )
+)
+
+(define-private (update-cited-content-score (content-hash (buff 32)) (citation-type uint))
+  (let (
+    (current-score (default-to 
+      { times-cited: u0, citation-quality-score: u0, last-citation-block: u0 }
+      (map-get? citation-scores { content-hash: content-hash })
+    ))
+    (quality-boost (if (is-eq citation-type CITATION_DIRECT) u3
+                    (if (is-eq citation-type CITATION_INDIRECT) u2 u1)))
+  )
+    (map-set citation-scores
+      { content-hash: content-hash }
+      {
+        times-cited: (+ (get times-cited current-score) u1),
+        citation-quality-score: (+ (get citation-quality-score current-score) quality-boost),
+        last-citation-block: stacks-block-height
+      }
+    )
+  )
+)
+
+(define-private (update-citation-stats (institution principal) (citation-count uint))
+  (let (
+    (current-stats (default-to 
+      { total-citations-made: u0, total-citations-received: u0, citation-reputation: u100 }
+      (map-get? institution-citation-stats { institution: institution })
+    ))
+  )
+    (map-set institution-citation-stats
+      { institution: institution }
+      (merge current-stats 
+        { 
+          total-citations-made: (+ (get total-citations-made current-stats) citation-count),
+          citation-reputation: (+ (get citation-reputation current-stats) citation-count)
+        }
+      )
+    )
+  )
+)
+
+(define-read-only (get-content-citations (content-hash (buff 32)))
+  (ok {
+    citation-score: (map-get? citation-scores { content-hash: content-hash }),
+    citing-this-content: (filter-citations-by-cited content-hash)
+  })
+)
+
+(define-read-only (get-citation-relationship (citing-content (buff 32)) (cited-content (buff 32)))
+  (map-get? content-citations { citing-content: citing-content, cited-content: cited-content })
+)
+
+(define-read-only (get-institution-citation-stats (institution principal))
+  (map-get? institution-citation-stats { institution: institution })
+)
+
+(define-private (filter-citations-by-cited (cited-content (buff 32)))
+  none
 )

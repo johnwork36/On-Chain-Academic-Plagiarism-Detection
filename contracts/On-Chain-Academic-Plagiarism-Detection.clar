@@ -17,6 +17,21 @@
 (define-constant CITATION_INDIRECT u2)
 (define-constant CITATION_DERIVATIVE u3)
 
+(define-constant ERR_DISPUTE_EXISTS (err u107))
+(define-constant ERR_DISPUTE_NOT_FOUND (err u108))
+(define-constant ERR_ALREADY_VOTED (err u109))
+(define-constant ERR_DISPUTE_CLOSED (err u110))
+(define-constant ERR_INSUFFICIENT_REPUTATION (err u111))
+
+(define-constant DISPUTE_OPEN u1)
+(define-constant DISPUTE_RESOLVED_PLAGIARISM u2)
+(define-constant DISPUTE_RESOLVED_LEGITIMATE u3)
+(define-constant DISPUTE_INCONCLUSIVE u4)
+
+(define-constant MIN_VALIDATOR_REPUTATION u50)
+(define-constant VOTE_THRESHOLD u3)
+
+(define-data-var total-disputes uint u0)
 
 (define-data-var contract-owner principal CONTRACT_OWNER)
 (define-data-var total-submissions uint u0)
@@ -472,4 +487,213 @@
 
 (define-private (filter-citations-by-cited (cited-content (buff 32)))
   none
+)
+
+
+(define-map content-disputes
+  { dispute-id: uint }
+  {
+    original-content: (buff 32),
+    suspected-content: (buff 32),
+    disputing-institution: principal,
+    accused-institution: principal,
+    status: uint,
+    votes-plagiarism: uint,
+    votes-legitimate: uint,
+    resolution-block: (optional uint),
+    stake-pool: uint
+  }
+)
+
+(define-map validator-votes
+  { dispute-id: uint, validator: principal }
+  {
+    vote: bool,
+    stake-amount: uint,
+    timestamp: uint
+  }
+)
+
+(define-map validator-stats
+  { validator: principal }
+  {
+    total-votes: uint,
+    correct-votes: uint,
+    reputation: uint,
+    total-stake: uint
+  }
+)
+
+(define-public (create-dispute 
+  (original-content (buff 32))
+  (suspected-content (buff 32))
+  (stake-amount uint))
+  (let (
+    (disputing-institution tx-sender)
+    (dispute-id (var-get total-disputes))
+    (current-block stacks-block-height)
+  )
+    (match (map-get? submissions { content-hash: suspected-content })
+      suspected-submission
+      (match (map-get? institutions { institution: disputing-institution })
+        institution-data
+        (if (>= (get reputation-score institution-data) stake-amount)
+          (begin
+            (map-set content-disputes
+              { dispute-id: dispute-id }
+              {
+                original-content: original-content,
+                suspected-content: suspected-content,
+                disputing-institution: disputing-institution,
+                accused-institution: (get institution suspected-submission),
+                status: DISPUTE_OPEN,
+                votes-plagiarism: u0,
+                votes-legitimate: u0,
+                resolution-block: none,
+                stake-pool: stake-amount
+              }
+            )
+            (var-set total-disputes (+ dispute-id u1))
+            (ok dispute-id)
+          )
+          (err ERR_INSUFFICIENT_REPUTATION)
+        )
+        (err ERR_NOT_FOUND)
+      )
+      (err ERR_NOT_FOUND)
+    )
+  )
+)
+
+(define-public (vote-on-dispute (dispute-id uint) (vote-plagiarism bool) (stake-amount uint))
+  (let (
+    (validator tx-sender)
+    (current-block stacks-block-height)
+    (current-time (default-to u0 (get-stacks-block-info? time current-block)))
+  )
+    (match (map-get? content-disputes { dispute-id: dispute-id })
+      dispute-data
+      (if (is-eq (get status dispute-data) DISPUTE_OPEN)
+        (if (is-none (map-get? validator-votes { dispute-id: dispute-id, validator: validator }))
+          (let (
+            (validator-rep (get-validator-reputation validator))
+          )
+            (if (>= validator-rep MIN_VALIDATOR_REPUTATION)
+              (begin
+                (map-set validator-votes
+                  { dispute-id: dispute-id, validator: validator }
+                  {
+                    vote: vote-plagiarism,
+                    stake-amount: stake-amount,
+                    timestamp: current-time
+                  }
+                )
+                (map-set content-disputes
+                  { dispute-id: dispute-id }
+                  (merge dispute-data {
+                    votes-plagiarism: (if vote-plagiarism 
+                      (+ (get votes-plagiarism dispute-data) u1)
+                      (get votes-plagiarism dispute-data)),
+                    votes-legitimate: (if vote-plagiarism 
+                      (get votes-legitimate dispute-data)
+                      (+ (get votes-legitimate dispute-data) u1)),
+                    stake-pool: (+ (get stake-pool dispute-data) stake-amount)
+                  })
+                )
+                (update-validator-stats validator u1)
+                (ok true)
+              )
+              (err ERR_INSUFFICIENT_REPUTATION)
+            )
+          )
+          (err ERR_ALREADY_VOTED)
+        )
+        (err ERR_DISPUTE_CLOSED)
+      )
+      (err ERR_DISPUTE_NOT_FOUND)
+    )
+  )
+)
+
+(define-public (resolve-dispute (dispute-id uint))
+  (let (
+    (current-block stacks-block-height)
+  )
+    (match (map-get? content-disputes { dispute-id: dispute-id })
+      dispute-data
+      (if (is-eq (get status dispute-data) DISPUTE_OPEN)
+        (let (
+          (total-votes (+ (get votes-plagiarism dispute-data) (get votes-legitimate dispute-data)))
+          (plagiarism-votes (get votes-plagiarism dispute-data))
+          (legitimate-votes (get votes-legitimate dispute-data))
+        )
+          (if (>= total-votes VOTE_THRESHOLD)
+            (let (
+              (resolution (if (> plagiarism-votes legitimate-votes)
+                DISPUTE_RESOLVED_PLAGIARISM
+                (if (> legitimate-votes plagiarism-votes)
+                  DISPUTE_RESOLVED_LEGITIMATE
+                  DISPUTE_INCONCLUSIVE)))
+            )
+              (begin
+                (map-set content-disputes
+                  { dispute-id: dispute-id }
+                  (merge dispute-data {
+                    status: resolution,
+                    resolution-block: (some current-block)
+                  })
+                )
+                (distribute-rewards dispute-id resolution)
+                (ok resolution)
+              )
+            )
+            (err ERR_DISPUTE_NOT_FOUND)
+          )
+        )
+        (err ERR_DISPUTE_CLOSED)
+      )
+      (err ERR_DISPUTE_NOT_FOUND)
+    )
+  )
+)
+
+(define-private (distribute-rewards (dispute-id uint) (resolution uint))
+  true
+)
+
+(define-private (get-validator-reputation (validator principal))
+  (match (map-get? validator-stats { validator: validator })
+    stats (get reputation stats)
+    u100
+  )
+)
+
+(define-private (update-validator-stats (validator principal) (vote-count uint))
+  (let (
+    (current-stats (default-to 
+      { total-votes: u0, correct-votes: u0, reputation: u100, total-stake: u0 }
+      (map-get? validator-stats { validator: validator })
+    ))
+  )
+    (map-set validator-stats
+      { validator: validator }
+      (merge current-stats { total-votes: (+ (get total-votes current-stats) vote-count) })
+    )
+  )
+)
+
+(define-read-only (get-dispute-details (dispute-id uint))
+  (map-get? content-disputes { dispute-id: dispute-id })
+)
+
+(define-read-only (get-validator-vote (dispute-id uint) (validator principal))
+  (map-get? validator-votes { dispute-id: dispute-id, validator: validator })
+)
+
+(define-read-only (get-validator-stats-info (validator principal))
+  (map-get? validator-stats { validator: validator })
+)
+
+(define-read-only (get-total-disputes)
+  (var-get total-disputes)
 )

@@ -31,6 +31,15 @@
 (define-constant MIN_VALIDATOR_REPUTATION u50)
 (define-constant VOTE_THRESHOLD u3)
 
+(define-constant ERR_BADGE_EXISTS (err u112))
+(define-constant ERR_BADGE_NOT_ELIGIBLE (err u113))
+
+(define-constant BADGE_ORIGINAL_SCHOLAR u1)
+(define-constant BADGE_CITATION_MASTER u2)
+(define-constant BADGE_INTEGRITY_CHAMPION u3)
+(define-constant BADGE_PROLIFIC_CONTRIBUTOR u4)
+(define-constant BADGE_INSTITUTION_EXCELLENCE u5)
+
 (define-data-var total-disputes uint u0)
 
 (define-data-var contract-owner principal CONTRACT_OWNER)
@@ -696,4 +705,82 @@
 
 (define-read-only (get-total-disputes)
   (var-get total-disputes)
+)
+
+
+(define-map student-badges
+  { institution: principal, student-id: (string-ascii 50), badge-type: uint }
+  {
+    awarded-at: uint,
+    awarded-block: uint,
+    submission-count: uint,
+    citation-count: uint
+  }
+)
+
+(define-map badge-counts
+  { institution: principal, student-id: (string-ascii 50) }
+  { total-badges: uint }
+)
+
+(define-public (award-badge
+  (student-id (string-ascii 50))
+  (badge-type uint)
+  (submission-count uint)
+  (citation-count uint))
+  (let (
+    (institution tx-sender)
+    (current-block stacks-block-height)
+    (current-time (default-to u0 (get-stacks-block-info? time current-block)))
+  )
+    (match (map-get? institutions { institution: institution })
+      institution-data
+      (if (get verified institution-data)
+        (if (is-none (map-get? student-badges 
+          { institution: institution, student-id: student-id, badge-type: badge-type }))
+          (begin
+            (map-set student-badges
+              { institution: institution, student-id: student-id, badge-type: badge-type }
+              {
+                awarded-at: current-time,
+                awarded-block: current-block,
+                submission-count: submission-count,
+                citation-count: citation-count
+              }
+            )
+            (update-badge-count institution student-id)
+            (ok true)
+          )
+          (err ERR_BADGE_EXISTS)
+        )
+        (err ERR_INVALID_INSTITUTION)
+      )
+      (err ERR_NOT_FOUND)
+    )
+  )
+)
+
+(define-private (update-badge-count (institution principal) (student-id (string-ascii 50)))
+  (let (
+    (current-count (default-to { total-badges: u0 }
+      (map-get? badge-counts { institution: institution, student-id: student-id })))
+  )
+    (map-set badge-counts
+      { institution: institution, student-id: student-id }
+      { total-badges: (+ (get total-badges current-count) u1) }
+    )
+  )
+)
+
+(define-read-only (get-student-badge
+  (institution principal)
+  (student-id (string-ascii 50))
+  (badge-type uint))
+  (map-get? student-badges { institution: institution, student-id: student-id, badge-type: badge-type })
+)
+
+(define-read-only (get-student-badge-count
+  (institution principal)
+  (student-id (string-ascii 50)))
+  (map-get? badge-counts { institution: institution, student-id: student-id })
 )
